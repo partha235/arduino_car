@@ -1,0 +1,2 @@
+# Arduino Car Kit
+This repo is to make arduino based car kit which is widely available on market. This repo has the codes to start from very scratch as basic test program and has circuit image along the folder. 
