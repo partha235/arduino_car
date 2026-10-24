@@ -1,136 +1,162 @@
 #include <Wire.h>
 #include "Adafruit_TCS34725.h"
 
-// Motor pins (L298N style - full 4-pin control)
-#define M1 8   // Left forward
-#define M2 9   // Left backward
-#define M3 10  // Right forward
-#define M4 12  // Right backward
+// ================== PIN DEFINITIONS ==================
+#define M1  8   // Left forward
+#define M2  9   // Left backward
+#define M3  10  // Right forward
+#define M4  12  // Right backward
+#define Ep  11  // Enable (PWM)
 
-#define Ep 11
-
-// RGB LED pins (visual feedback)
+// RGB LED (common anode)
 #define redpin   3
 #define greenpin 5
 #define bluepin  6
 #define commonAnode true
 
+// ================== TUNING ==================
+const int   SPEED           = 110;      // 0-255
+const int   RED_MIN         = 70;       // Minimum red value
+const float RED_RATIO       = 1.35;     // red must be this times higher than G and B
+const unsigned long SEARCH_TIMEOUT = 700;  // ms without red before searching
+const int   SEARCH_SPIN_MS  = 90;       // how long each search spin lasts
+
+// ================== GLOBALS ==================
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(
+  TCS34725_INTEGRATIONTIME_24MS,
+  TCS34725_GAIN_16X
+);
+
 byte gammatable[256];
-
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_16X);
-
-// Simple tuning
-const int   RED_THRESHOLD    = 120;     // red value > this → on red
-const unsigned long SEARCH_TIMEOUT = 800;  // ms without red before search
-
-int speed = 100;
-
 unsigned long lastSeenRed = 0;
+bool searchingLeft = true;
 
+// ================== SETUP ==================
 void setup() {
   Serial.begin(9600);
 
-  // Motor pins
   pinMode(M1, OUTPUT);
   pinMode(M2, OUTPUT);
   pinMode(M3, OUTPUT);
   pinMode(M4, OUTPUT);
   pinMode(Ep, OUTPUT);
+  analogWrite(Ep, SPEED);
 
-  analogWrite(Ep,speed);
-
-  if (tcs.begin()) {
-    Serial.println("TCS34725 found");
-  } else {
-    Serial.println("No TCS34725 ... check wiring");
-    while (1);
-  }
-
-  // RGB LED setup
   pinMode(redpin, OUTPUT);
   pinMode(greenpin, OUTPUT);
   pinMode(bluepin, OUTPUT);
 
+  // Gamma correction table for LED
   for (int i = 0; i < 256; i++) {
     float x = i / 255.0;
     x = pow(x, 2.5) * 255.0;
     gammatable[i] = commonAnode ? 255 - x : x;
   }
 
+  if (tcs.begin()) {
+    Serial.println("TCS34725 found");
+  } else {
+    Serial.println("No TCS34725 found - check wiring!");
+    while (1);
+  }
+
   stopMotors();
-  Serial.println("Ready. Place red close to sensor.");
-  Serial.println("Red > 120 → forward");
-  Serial.println("Red <= 120 → search by turning");
+  Serial.println("Ready. Looking for red...");
 }
 
+// ================== MAIN LOOP ==================
 void loop() {
-  analogWrite(Ep,speed);
-  float rf, gf, bf;
-  tcs.setInterrupt(false);  // sensor LED on
-  delay(30);
-  tcs.getRGB(&rf, &gf, &bf);
-  tcs.setInterrupt(true);   // sensor LED off
+  // ---- Read color sensor ----
+  float r, g, b;
+  tcs.setInterrupt(false);          // LED on
+  delay(28);                        // wait for integration
+  tcs.getRGB(&r, &g, &b);
+  tcs.setInterrupt(true);           // LED off
 
-  int red   = (int)rf;
-  int green = (int)gf;
-  int blue  = (int)bf;
+  int red   = (int)r;
+  int green = (int)g;
+  int blue  = (int)b;
 
-  // RGB LED shows detected color
+  // Show color on RGB LED
   analogWrite(redpin,   gammatable[constrain(red,   0, 255)]);
   analogWrite(greenpin, gammatable[constrain(green, 0, 255)]);
   analogWrite(bluepin,  gammatable[constrain(blue,  0, 255)]);
 
-  // --- Improved red detection ---
-  bool seesRed = (red > 80) &&
-                 (red > green * 1.4) &&
-                 (red > blue * 1.4);
+  // ---- Red detection ----
+  bool seesRed = (red > RED_MIN) &&
+                 (red > green * RED_RATIO) &&
+                 (red > blue  * RED_RATIO);
 
+  // ---- Decision ----
   if (seesRed) {
     lastSeenRed = millis();
-    digitalWrite(M1, HIGH);
-    digitalWrite(M2, LOW);
-    digitalWrite(M3, HIGH);
-    digitalWrite(M4, LOW);
-    Serial.println("RED detected → forward");
+    moveForward();
+    Serial.println("RED → FORWARD");
   }
   else if (millis() - lastSeenRed < SEARCH_TIMEOUT) {
-    digitalWrite(M1, HIGH);
-    digitalWrite(M2, LOW);
-    digitalWrite(M3, HIGH);
-    digitalWrite(M4, LOW);
+    // Recently saw red → keep going a bit more
+    moveForward();
     Serial.println("Recent red → continue");
   }
   else {
-    if ((millis() / 700) % 2 == 0) {
-      Serial.println("Searching RIGHT");
-      digitalWrite(M1, HIGH);
-      digitalWrite(M2, LOW);
-      digitalWrite(M3, LOW);
-      digitalWrite(M4, HIGH);
-      delay(120);
-    } else {
-      Serial.println("Searching LEFT");
-      digitalWrite(M1, LOW);
-      digitalWrite(M2, HIGH);
-      digitalWrite(M3, HIGH);
-      digitalWrite(M4, LOW);
-      delay(120);
-    }
+    // Lost red → search by spinning
+    searchForRed();
   }
 
-  // --- Debug ---
-  Serial.print("R: "); Serial.print(red);
-  Serial.print("  G: "); Serial.print(green);
-  Serial.print("  B: "); Serial.print(blue);
-  Serial.print("  seesRed: "); Serial.println(seesRed ? "YES" : "NO");
-
-  delay(30);
+  // Debug
+  Serial.print("R:"); Serial.print(red);
+  Serial.print(" G:"); Serial.print(green);
+  Serial.print(" B:"); Serial.print(blue);
+  Serial.print("  seesRed:"); Serial.println(seesRed ? "YES" : "NO");
 }
 
+// ================== MOTOR FUNCTIONS ==================
+void moveForward() {
+  analogWrite(Ep, SPEED);
+  digitalWrite(M1, HIGH);
+  digitalWrite(M2, LOW);
+  digitalWrite(M3, HIGH);
+  digitalWrite(M4, LOW);
+}
+
+void spinLeft() {
+  analogWrite(Ep, SPEED);
+  digitalWrite(M1, LOW);
+  digitalWrite(M2, HIGH);   // Left backward
+  digitalWrite(M3, HIGH);   // Right forward
+  digitalWrite(M4, LOW);
+}
+
+void spinRight() {
+  analogWrite(Ep, SPEED);
+  digitalWrite(M1, HIGH);   // Left forward
+  digitalWrite(M2, LOW);
+  digitalWrite(M3, LOW);
+  digitalWrite(M4, HIGH);   // Right backward
+}
 
 void stopMotors() {
+  analogWrite(Ep, 0);
   digitalWrite(M1, LOW);
   digitalWrite(M2, LOW);
   digitalWrite(M3, LOW);
   digitalWrite(M4, LOW);
+}
+
+// Non-blocking search (alternates direction)
+void searchForRed() {
+  static unsigned long lastSpinChange = 0;
+
+  if (millis() - lastSpinChange > SEARCH_SPIN_MS) {
+    searchingLeft = !searchingLeft;
+    lastSpinChange = millis();
+  }
+
+  if (searchingLeft) {
+    spinLeft();
+    Serial.println("Searching LEFT");
+  } else {
+    spinRight();
+    Serial.println("Searching RIGHT");
+  }
 }
